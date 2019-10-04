@@ -20,6 +20,7 @@ import com.google.common.collect.Sets;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Deactivate;
+import org.apache.felix.scr.annotations.Property;
 import org.apache.felix.scr.annotations.Reference;
 import org.apache.felix.scr.annotations.ReferenceCardinality;
 import org.onlab.packet.EthType;
@@ -81,7 +82,9 @@ import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Igmp process application, use proxy mode, support first join/ last leave , fast leave
@@ -143,6 +146,15 @@ public class IgmpManager {
     protected NetworkConfigRegistry networkConfig;
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected MulticastRouteService multicastService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected IgmpStatisticsService igmpStatisticsManager;
+
+    private static final int DEFAULT_REPEAT_DELAY = 20;
+    @Property(name = "statisticsGenerationEvent", intValue = DEFAULT_REPEAT_DELAY,
+            label = "statisticsGenerationEvent")
+    private int statisticsGenerationEvent = DEFAULT_REPEAT_DELAY;
+
     private IgmpPacketProcessor processor = new IgmpPacketProcessor();
     private Logger log = LoggerFactory.getLogger(getClass());
     private ApplicationId coreAppId;
@@ -152,6 +164,29 @@ public class IgmpManager {
             new InternalNetworkConfigListener();
     private DeviceListener deviceListener = new InternalDeviceListener();
     private ConfigFactory<DeviceId, AccessDeviceConfig> configFactory = null;
+
+    protected IgmpStatisticsEventPublisher igmpStatisticsPublisher;
+
+
+    ScheduledFuture<?> scheduledFuture;
+    protected CalculatePeak calculatePeak;
+    ScheduledExecutorService executorForPeakValue;
+    private static final int DEFAULT_PEAK_VALUE_REPEAT_DELAY = 1;
+    @Property(name = "statisticsGenerationEventForPeakValue", intValue = DEFAULT_PEAK_VALUE_REPEAT_DELAY,
+            label = "statisticsGenerationEventForPeakValue")
+    private int statisticsGenerationEventForPeakValue = DEFAULT_PEAK_VALUE_REPEAT_DELAY;
+    ScheduledExecutorService executorForIgmp;
+
+    private long peakMsgCount;
+    private long peakMsgDuration;
+    private long peakDisconnectCount;
+    private long peakDisconnectDuration;
+    private long peakConnectionCount;
+    private long peakConnectionDuration;
+    List<Long> peakMsgCountList = new ArrayList<Long>();
+    List<Long> peakDisconnectList = new ArrayList<Long>();
+    List<Long> peakConnectionList = new ArrayList<Long>();
+
     private ConfigFactory<ApplicationId, IgmpproxyConfig> igmpproxyConfigFactory =
             new ConfigFactory<ApplicationId, IgmpproxyConfig>(
                     SubjectFactories.APP_SUBJECT_FACTORY, IGMPPROXY_CONFIG_CLASS, "igmpproxy") {
@@ -178,6 +213,7 @@ public class IgmpManager {
 
     @Activate
     protected void activate() {
+        log.info("Entering in activate");
         appId = coreService.registerApplication("org.opencord.igmpproxy");
         coreAppId = coreService.registerApplication(CoreService.CORE_APP_NAME);
         packetService.addProcessor(processor, PacketProcessor.director(4));
@@ -226,7 +262,16 @@ public class IgmpManager {
         }
         deviceService.addListener(deviceListener);
         scheduledExecutorService.scheduleAtFixedRate(new IgmpProxyTimerTask(), 0, 1000, TimeUnit.MILLISECONDS);
-
+        log.info("creating executor");
+        executorForIgmp = Executors.newScheduledThreadPool(1);
+        log.info("created executor");
+        igmpStatisticsPublisher = new IgmpStatisticsEventPublisher();
+        scheduledFuture = executorForIgmp.scheduleAtFixedRate(igmpStatisticsPublisher,
+                0, statisticsGenerationEvent, TimeUnit.SECONDS);
+        calculatePeak = new CalculatePeak();
+        executorForPeakValue = Executors.newScheduledThreadPool(1);
+        scheduledFuture = executorForPeakValue.scheduleAtFixedRate(calculatePeak, 0,
+                                                  statisticsGenerationEventForPeakValue, TimeUnit.SECONDS);
         log.info("Started");
     }
 
@@ -244,7 +289,8 @@ public class IgmpManager {
         deviceService.removeListener(deviceListener);
         packetService.removeProcessor(processor);
         flowRuleService.removeFlowRulesById(appId);
-
+        scheduledFuture.cancel(true);
+        executorForIgmp.shutdown();
         log.info("Stopped");
     }
 
@@ -357,6 +403,8 @@ public class IgmpManager {
         GroupMember groupMember = groupMemberMap.get(groupMemberKey);
 
         if (join) {
+            //TODO FOR Total number of join requests
+            igmpStatisticsManager.getIgmpStats().increaseIgmpJoinReq();
             if (groupMember == null) {
                 if (igmpType == IGMP.TYPE_IGMPV2_MEMBERSHIP_REPORT) {
                     groupMember = new GroupMember(groupIp, vlan, deviceId, portNumber, true);
@@ -366,13 +414,23 @@ public class IgmpManager {
 
                 Optional<ConnectPoint> sourceConfigured = getSource();
                 if (!sourceConfigured.isPresent()) {
+                     //TODO for Total number of failed join requests
+                     igmpStatisticsManager.getIgmpStats().increaseIgmpFailJoinReq();
                     log.warn("Unable to process IGMP Join from {} since no source " +
                                      "configuration is found.", deviceId);
                     return;
                 }
                 HashSet<ConnectPoint> sourceConnectPoints = Sets.newHashSet(sourceConfigured.get());
 
-                StateMachine.join(deviceId, groupIp, srcIp);
+                boolean isJoined = StateMachine.join(deviceId, groupIp, srcIp);
+                if (isJoined) {
+                    //TODO for Total number of successful join and rejoin requests
+                    igmpStatisticsManager.getIgmpStats().increaseIgmpSuccessJoinRejoinReq();
+                    peakConnectionCount++;
+                } else {
+                    //TODO if isJoined is false then falid join should increase
+                    igmpStatisticsManager.getIgmpStats().increaseIgmpFailJoinReq();
+                }
                 groupMemberMap.put(groupMemberKey, groupMember);
                 groupMember.updateList(recordType, sourceList);
                 groupMember.getSourceList().forEach(source -> {
@@ -390,12 +448,15 @@ public class IgmpManager {
             groupMember.updateList(recordType, sourceList);
             groupMember.setLeave(false);
         } else {
+            // TODO Total number of leaves requests
+            igmpStatisticsManager.getIgmpStats().increaseIgmpLeaveReq();
             if (groupMember == null) {
                 log.info("receive leave but no instance, group " + groupIp.toString() +
                         " device:" + deviceId.toString() + " port:" + portNumber.toString());
                 return;
             } else {
                 groupMember.setLeave(true);
+
                 if (fastLeave) {
                     leaveAction(groupMember);
                 } else {
@@ -406,6 +467,10 @@ public class IgmpManager {
     }
 
     private void leaveAction(GroupMember groupMember) {
+        //TODO Total number of disconnects
+        igmpStatisticsManager.getIgmpStats().increaseIgmpDisconnect();
+        peakDisconnectCount++;
+//        igmpStatisticsManager.calculatePeakFromList(false, true, false);
         ConnectPoint cp = new ConnectPoint(groupMember.getDeviceId(), groupMember.getPortNumber());
         StateMachine.leave(groupMember.getDeviceId(), groupMember.getGroupIp());
         groupMember.getSourceList().forEach(source -> multicastService.removeSinks(
@@ -421,6 +486,8 @@ public class IgmpManager {
             ethpkt = IgmpSender.getInstance().buildIgmpV2Query(groupMember.getGroupIp(), srcIp);
         } else {
             ethpkt = IgmpSender.getInstance().buildIgmpV3Query(groupMember.getGroupIp(), srcIp);
+            //TODO Total number of GSSQ source specific query requests
+            igmpStatisticsManager.getIgmpStats().increaseIgmpGssqReq();
         }
         IgmpSender.getInstance().sendIgmpPacket(ethpkt, groupMember.getDeviceId(), groupMember.getPortNumber());
     }
@@ -437,29 +504,38 @@ public class IgmpManager {
      * Packet processor responsible for forwarding packets along their paths.
      */
     private class IgmpPacketProcessor implements PacketProcessor {
+
         @Override
         public void process(PacketContext context) {
 
             try {
+                peakMsgCount++;
+                //TODO Total number of messages received.
+                igmpStatisticsManager.getIgmpStats().increaseTotalMsgReceived();
                 InboundPacket pkt = context.inPacket();
                 Ethernet ethPkt = pkt.parsed();
                 if (ethPkt == null) {
+                //TODO
+                    log.info("packet type is null");
                     return;
                 }
-
                 if (ethPkt.getEtherType() != Ethernet.TYPE_IPV4) {
+                    //TODO
+                    log.info("Ethernet type is not IPV4");
                     return;
                 }
 
                 IPv4 ipv4Pkt = (IPv4) ethPkt.getPayload();
-
+                //TODO
+                log.info("Protocol type is :" + ipv4Pkt.getProtocol());
                 if (ipv4Pkt.getProtocol() != IPv4.PROTOCOL_IGMP) {
+                //TODO
+                log.info("protocol type is not ipv4");
                     return;
                 }
 
                 short vlan = ethPkt.getVlanID();
                 DeviceId deviceId = pkt.receivedFrom().deviceId();
-
                 if (oltData.get(deviceId) == null &&
                         !isConnectPoint(deviceId, pkt.receivedFrom().port())) {
                     log.error("Device not registered in netcfg :" + deviceId.toString());
@@ -469,6 +545,8 @@ public class IgmpManager {
                 IGMP igmp = (IGMP) ipv4Pkt.getPayload();
                 switch (igmp.getIgmpType()) {
                     case IGMP.TYPE_IGMPV3_MEMBERSHIP_QUERY:
+                        //TODO
+                        igmpStatisticsManager.getIgmpStats().increaseIgmpv3MembershipQuery();
                         //Discard Query from OLT’s non-uplink port’s
                         if (!pkt.receivedFrom().port().equals(getDeviceUplink(deviceId))) {
                             if (isConnectPoint(deviceId, pkt.receivedFrom().port())) {
@@ -488,11 +566,19 @@ public class IgmpManager {
                                 0xff & igmp.getMaxRespField());
                         break;
                     case IGMP.TYPE_IGMPV1_MEMBERSHIP_REPORT:
+                        //TODO
+                        igmpStatisticsManager.getIgmpStats().increaseIgmpv1MemershipReport();
                         log.debug("IGMP version 1  message types are not currently supported.");
                         break;
                     case IGMP.TYPE_IGMPV3_MEMBERSHIP_REPORT:
+                        //TODO
+                        igmpStatisticsManager.getIgmpStats().increaseIgmpv3MembershipReport();
                     case IGMP.TYPE_IGMPV2_MEMBERSHIP_REPORT:
+                        //TODO
+                         igmpStatisticsManager.getIgmpStats().increaseIgmpv2MembershipReport();
                     case IGMP.TYPE_IGMPV2_LEAVE_GROUP:
+                        //TODO
+                        igmpStatisticsManager.getIgmpStats().increaseIgmpv2LeaveGroup();
                         //Discard join/leave from OLT’s uplink port’s
                         if (pkt.receivedFrom().port().equals(getDeviceUplink(deviceId)) ||
                                 isConnectPoint(deviceId, pkt.receivedFrom().port())) {
@@ -519,8 +605,12 @@ public class IgmpManager {
 
                     default:
                         log.info("wrong IGMP v3 type:" + igmp.getIgmpType());
+                        //TODO Total number of invalid IGMP messages received
+                        igmpStatisticsManager.getIgmpStats().increaseInvalidIgmpMsgReceived();
                         break;
                 }
+                //TODO Total number of IGMP messages received
+                igmpStatisticsManager.getIgmpStats().countIgmpMsgReceived();
 
             } catch (Exception ex) {
                 log.error("igmp process error : {} ", ex);
@@ -562,6 +652,8 @@ public class IgmpManager {
                 groupMember.lastQueryInterval(true); // count times
             } else if (groupMember.getLastQueryCount() < lastQueryCount - 1) {
                 sendQuery(groupMember);
+                //TODO Total number of GSQ specific query requests
+                igmpStatisticsManager.getIgmpStats().increaseIgmpGsqReq();
                 groupMember.lastQueryInterval(false); // reset count number
                 groupMember.lastQueryCount(true); //count times
             } else if (groupMember.getLastQueryCount() == lastQueryCount - 1) {
@@ -574,6 +666,8 @@ public class IgmpManager {
                 groupMember.keepAliveInterval(true);
             } else if (groupMember.getKeepAliveQueryCount() < keepAliveCount) {
                 sendQuery(groupMember);
+                //TODO Total number of GMQ member query requests
+                igmpStatisticsManager.getIgmpStats().increaseIgmpGmqReq();
                 groupMember.keepAliveInterval(false);
                 groupMember.keepAliveQueryCount(true);
             } else if (groupMember.getKeepAliveQueryCount() == keepAliveCount) {
@@ -866,5 +960,82 @@ public class IgmpManager {
             return;
         }
         processFilterObjective(connectPoint.deviceId(), connectPoint.port(), true);
+    }
+
+    private class IgmpStatisticsEventPublisher implements Runnable {
+        public void run() {
+            log.info("Notifying IgmpStatisticsEvent");
+            log.debug("IgmpJoinReq  ======= " + igmpStatisticsManager.getIgmpStats().getIgmpJoinReq());
+            log.debug("IgmpSuccessJoinRejoinReq ======= " + igmpStatisticsManager.
+                    getIgmpStats().getIgmpSuccessJoinRejoinReq());
+            log.debug("IgmpFailJoinReq ======= " + igmpStatisticsManager.getIgmpStats().getIgmpFailJoinReq());
+            log.debug("IgmpLeaveReq ======= " + igmpStatisticsManager.getIgmpStats().getIgmpLeaveReq());
+            log.debug("IgmpDisconnect ======= " + igmpStatisticsManager.getIgmpStats().getIgmpDisconnect());
+            log.debug("IgmpGssqReq ======= " + igmpStatisticsManager.getIgmpStats().getIgmpGssqReq());
+            log.debug("TotalMsgReceived ======= " + igmpStatisticsManager.getIgmpStats().getTotalMsgReceived());
+            log.debug("IgmpMsgReceived ======= " + igmpStatisticsManager.getIgmpStats().getIgmpMsgReceived());
+            log.debug("InvalidIgmpMsgReceived =======" + igmpStatisticsManager.getIgmpStats().
+                                                          getInvalidIgmpMsgReceived());
+            log.debug("IgmpGmqReq ======= " + igmpStatisticsManager.getIgmpStats().getIgmpGmqReq());
+            log.debug("IgmpGsqReq ======= " + igmpStatisticsManager.getIgmpStats().getIgmpGsqReq());
+            log.debug("IgmpPeakMsgReceivedPerSec =========" + igmpStatisticsManager.
+                                                          getIgmpStats().getPeakMsgReceivedPerSec());
+            log.debug("IgmpDurationOfPeakMsg ======= " + igmpStatisticsManager.
+                                                          getIgmpStats().getDurationOfPeakMsg());
+            log.debug("IgmpPeakDisconnectsPerformed =======" + igmpStatisticsManager.
+                                                          getIgmpStats().getPeakDisconnectsPerformed());
+            log.debug("IgmpDurationOfPeakDisconnects =======" + igmpStatisticsManager.
+                                                          getIgmpStats().getDurationOfPeakDisconnects());
+            log.debug("IgmpPeakConnectionEst ====== " + igmpStatisticsManager.getIgmpStats().
+                                                          getPeakconnectionEst());
+            log.debug("IgmpDurationOfPeakConnection ======= " + igmpStatisticsManager.getIgmpStats().
+                                                          getDurationOfPeakConnections());
+            igmpStatisticsManager.getStatsDelegate().
+                 notify(new IgmpStatisticsEvent(IgmpStatisticsEvent.Type.STATS_UPDATE,
+                                                                    igmpStatisticsManager.getIgmpStats()));
+        }
+    }
+
+    private class CalculatePeak implements Runnable {
+        public void run() {
+            log.debug("Calculating peaks");
+
+            //Peak message per second and duration of peak message
+            peakMsgCountList.add(peakMsgCount);
+            if (peakMsgCount > peakMsgCountList.get(peakMsgCountList.size() - 1)) {
+                //We got new peak value for message received
+                peakMsgDuration = 0;
+            } else {
+                peakMsgDuration++;
+            }
+            igmpStatisticsManager.getIgmpStats().setPeakMsgReceivedPerSec(new AtomicLong(peakMsgCount));
+            igmpStatisticsManager.getIgmpStats().setDurationOfPeakMsg(new AtomicLong(peakMsgDuration));
+            peakMsgCount = 0;
+
+            //Peak Disconnects per Second and duration of Peak Disconnects
+            peakDisconnectList.add(peakDisconnectCount);
+            if (peakDisconnectCount > peakDisconnectList.get(peakDisconnectList.size() - 1)) {
+                //We got new Peak Value for Disconnect
+                peakDisconnectDuration = 0;
+           } else {
+                peakDisconnectDuration++;
+           }
+            igmpStatisticsManager.getIgmpStats().setPeakDisconnectsPerformed(new AtomicLong(peakDisconnectCount));
+            igmpStatisticsManager.getIgmpStats().setDurationOfPeakDisconnects(new AtomicLong(peakDisconnectDuration));
+            peakDisconnectCount = 0;
+
+            //Peak Connect per Second and duration of Peak connects
+            peakConnectionList.add(peakConnectionCount);
+            if (peakConnectionCount > peakConnectionList.get(peakConnectionList.size() - 1)) {
+                //We get new Peak Value
+                peakConnectionDuration = 0;
+            } else {
+                peakConnectionDuration++;
+            }
+            igmpStatisticsManager.getIgmpStats().setPeakconnectionEst(new AtomicLong(peakConnectionCount));
+            igmpStatisticsManager.getIgmpStats().setDurationOfPeakConnections(new AtomicLong(peakConnectionDuration));
+            peakConnectionCount = 0;
+
+        }
     }
 }
